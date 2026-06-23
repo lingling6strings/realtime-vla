@@ -4,6 +4,8 @@ import triton.language as tl
 import numpy as np
 import torch.nn as nn
 from transformers import AutoTokenizer
+import torch.nn.functional as F
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from pi0_infer import (
     vision_encoder,
     layer_norm_matmul_n256_1152_2048_bias,
@@ -308,6 +310,41 @@ def softmax_kernel_masklen(
         tl.store(out_ptr + offs_i * keys + offs_j, vals.to(tl.bfloat16),
                  mask=(offs_i < queries) & (offs_j < keys))
 
+# @triton.jit
+# def flash_attn(q_ptr, k_ptr, v_ptr, out_ptr, 
+#     stride_qb: int, stride_qh: int, stride_qt: int, stride_qk: int,  #
+#     stride_kb: int, stride_kh: int, stride_kk: int, stride_kt: int,  #
+#     stride_vb: int, stride_vh: int, stride_vt: int, stride_vk: int,  #
+#     stride_ob: int, stride_oh: int, stride_ot: int, stride_ok: int, #
+#     M : tl.constexpr, N : tl.constexpr, K : tl.constexpr,
+#     scale_factor: tl.constexpr,
+#     BLOCK_SIZE_M : tl.constexpr = 32, BLOCK_SIZE_N : tl.constexpr = 32, BLOCK_SIZE_K : tl.constexpr = 64,
+# ):
+#     # loading sample len
+#     seq_len = M
+
+def flash_mqa_attention(q_ptr, k_ptr, v_ptr, o_ptr, valid_encoder_len, encoder_seq_len, scale):
+    # q_ptr: (encoder_seq_len * 8, 256)
+    # k_ptr/v_ptr:    (encoder_seq_len, 256)
+    q = q_ptr.view(encoder_seq_len, 8, 256).transpose(0, 1).unsqueeze(0)  # (1, 8, S, 256)
+    k = k_ptr.view(1, 1, encoder_seq_len, 256)                            # (1, 1, S, 256)
+    v = v_ptr.view(1, 1, encoder_seq_len, 256) 
+
+    key_pos = torch.arange(encoder_seq_len, device=q.device).view(1, 1, 1, encoder_seq_len)
+    attn_mask = key_pos < valid_encoder_len.view(1, 1, 1, 1) # True = keep
+
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        ctx = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+            enable_gqa=True,
+        )
+
+    o_ptr.copy_(ctx.squeeze(0).transpose(0,1).reshape(encoder_seq_len*8, 256))
+
 def transformer_encoder(weights, buffers, encoder_seq_len):
     layer_norm_matmul_n256_1152_2048_bias(
         buffers['vision_x'],
@@ -332,31 +369,42 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
             scale = 1.0 / (256 ** 0.5)
             total_queries = buffers['encoder_Q'].shape[0]
             total_keys = encoder_seq_len
-            matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](
+
+            # matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](
+            #     buffers['encoder_Q'],
+            #     buffers['encoder_K'][i, :encoder_seq_len],
+            #     buffers['encoder_logits_buf'],
+            #     total_queries,
+            #     total_keys,
+            #     256,
+            #     scale,
+            #     BLOCK_SIZE_M=32,
+            #     BLOCK_SIZE_N=32,
+            #     BLOCK_SIZE_K=64,
+            # )
+            # softmax_kernel_masklen[((total_queries + 3) // 4,)](
+            #     buffers['encoder_logits_buf'],
+            #     total_queries,
+            #     total_keys,
+            #     buffers['valid_encoder_len'],
+            #     buffers['encoder_attn_buf'],
+            #     BLOCK_SIZE_M=4,
+            #     BLOCK_SIZE=1024,
+            # )
+            # matmul_k8_n_256(
+            #     buffers['encoder_attn_buf'],
+            #     buffers['encoder_V'][i, :encoder_seq_len],
+            #     buffers['encoder_ctx_buf'],
+            # )
+
+            flash_mqa_attention(
                 buffers['encoder_Q'],
                 buffers['encoder_K'][i, :encoder_seq_len],
-                buffers['encoder_logits_buf'],
-                total_queries,
-                total_keys,
-                256,
-                scale,
-                BLOCK_SIZE_M=32,
-                BLOCK_SIZE_N=32,
-                BLOCK_SIZE_K=64,
-            )
-            softmax_kernel_masklen[((total_queries + 3) // 4,)](
-                buffers['encoder_logits_buf'],
-                total_queries,
-                total_keys,
-                buffers['valid_encoder_len'],
-                buffers['encoder_attn_buf'],
-                BLOCK_SIZE_M=4,
-                BLOCK_SIZE=1024,
-            )
-            matmul_k8_n_256(
-                buffers['encoder_attn_buf'],
                 buffers['encoder_V'][i, :encoder_seq_len],
                 buffers['encoder_ctx_buf'],
+                buffers['valid_encoder_len'],
+                encoder_seq_len,
+                scale,
             )
             
             matmul_n_2048_2048_res(
@@ -523,9 +571,15 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
         )
 
 def pi05_model(weights, buffers, num_views, encoder_seq_len, num_steps=10):
+    torch.cuda.nvtx.range_push("pi05.vision_decoder")
     vision_encoder(weights, buffers, num_views)
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("pi05.transformer_encoder")
     transformer_encoder(weights, buffers, encoder_seq_len)
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("pi05.transformer_decoder")
     transformer_decoder(weights, buffers, encoder_seq_len, num_steps)
+    torch.cuda.nvtx.range_pop()
 
 class Pi05Inference:
     def __init__(
