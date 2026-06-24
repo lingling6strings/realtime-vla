@@ -308,6 +308,80 @@ def softmax_kernel_masklen(
         tl.store(out_ptr + offs_i * keys + offs_j, vals.to(tl.bfloat16),
                  mask=(offs_i < queries) & (offs_j < keys))
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 4,  "BLOCK_N": 16, "HEAD_DIM": 256}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 8,  "BLOCK_N": 16, "HEAD_DIM": 256}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 8,  "BLOCK_N": 32, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 8,  "BLOCK_N": 64, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
+    ],
+    key=["total_queries", "total_keys"],
+)
+@triton.jit
+def flash_mqa_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    valid_keys_len_ptr,
+    total_queries: tl.constexpr,
+    total_keys: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    valid_keys_len = tl.load(valid_keys_len_ptr).to(tl.int32)
+    valid_keys_len = tl.maximum(0, tl.minimum(valid_keys_len, total_keys))
+
+    q = tl.load(
+        q_ptr + offs_m[:, None] * HEAD_DIM + offs_d[None, :],
+        mask=offs_m[:, None] < total_queries,
+        other=0.0,
+    )
+
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+    for start_n in range(0, total_keys, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        k = tl.load(
+            k_ptr + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
+            mask=offs_n[:, None] < valid_keys_len,
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.where(offs_n[None, :] < valid_keys_len, qk, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+
+        v = tl.load(
+            v_ptr + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
+            mask=offs_n[:, None] < valid_keys_len,
+            other=0.0,
+        )
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    tl.store(
+        o_ptr + offs_m[:, None] * HEAD_DIM + offs_d[None, :],
+        acc.to(tl.bfloat16),
+        mask=offs_m[:, None] < total_queries,
+    )
+
 def transformer_encoder(weights, buffers, encoder_seq_len):
     layer_norm_matmul_n256_1152_2048_bias(
         buffers['vision_x'],
@@ -332,31 +406,15 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
             scale = 1.0 / (256 ** 0.5)
             total_queries = buffers['encoder_Q'].shape[0]
             total_keys = encoder_seq_len
-            matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](
+            flash_mqa_attention_kernel[lambda META: (triton.cdiv(total_queries, META["BLOCK_M"]),)](
                 buffers['encoder_Q'],
                 buffers['encoder_K'][i, :encoder_seq_len],
-                buffers['encoder_logits_buf'],
-                total_queries,
-                total_keys,
-                256,
-                scale,
-                BLOCK_SIZE_M=32,
-                BLOCK_SIZE_N=32,
-                BLOCK_SIZE_K=64,
-            )
-            softmax_kernel_masklen[((total_queries + 3) // 4,)](
-                buffers['encoder_logits_buf'],
-                total_queries,
-                total_keys,
-                buffers['valid_encoder_len'],
-                buffers['encoder_attn_buf'],
-                BLOCK_SIZE_M=4,
-                BLOCK_SIZE=1024,
-            )
-            matmul_k8_n_256(
-                buffers['encoder_attn_buf'],
                 buffers['encoder_V'][i, :encoder_seq_len],
                 buffers['encoder_ctx_buf'],
+                buffers['valid_encoder_len'],
+                total_queries,
+                total_keys,
+                scale
             )
             
             matmul_n_2048_2048_res(
