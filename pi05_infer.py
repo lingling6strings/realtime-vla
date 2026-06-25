@@ -308,18 +308,24 @@ def softmax_kernel_masklen(
         tl.store(out_ptr + offs_i * keys + offs_j, vals.to(tl.bfloat16),
                  mask=(offs_i < queries) & (offs_j < keys))
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": 4,  "BLOCK_N": 16, "HEAD_DIM": 256}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 8,  "BLOCK_N": 16, "HEAD_DIM": 256}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 8,  "BLOCK_N": 32, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 8,  "BLOCK_N": 64, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32, "HEAD_DIM": 256}, num_warps=8, num_stages=3),
-    ],
-    key=["total_queries", "total_keys"],
-)
+
+configs = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64, 128]\
+    for s in [2, 3, 4] \
+    for w in [4, 8]\
+]
+
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    return not (torch.cuda.get_device_capability()[0] == 9 
+                and BLOCK_M * BLOCK_N < 128 * 128
+                and conf.num_warps == 8)
+
+@triton.autotune(configs=list(filter(keep, configs)), key=["total_queries", "total_keys"])
+
 @triton.jit
 def flash_mqa_attention_kernel(
     q_ptr,
@@ -329,7 +335,7 @@ def flash_mqa_attention_kernel(
     valid_keys_len_ptr,
     total_queries: tl.constexpr,
     total_keys: tl.constexpr,
-    scale: tl.constexpr,
+    sm_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -346,6 +352,8 @@ def flash_mqa_attention_kernel(
         mask=offs_m[:, None] < total_queries,
         other=0.0,
     )
+    
+    qk_scale: tl.constexpr = sm_scale * 1.44269504  # 1/log(2)
 
     m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -359,12 +367,12 @@ def flash_mqa_attention_kernel(
             mask=offs_n[:, None] < valid_keys_len,
             other=0.0,
         )
-        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.dot(q, tl.trans(k)) * qk_scale
         qk = tl.where(offs_n[None, :] < valid_keys_len, qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_new[:, None])
-        alpha = tl.exp(m_i - m_new)
+        p = tl.math.exp2(qk - m_new[:, None])
+        alpha = tl.math.exp2(m_i - m_new)
 
         v = tl.load(
             v_ptr + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
@@ -403,7 +411,7 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
             buffers['encoder_x_norm']
         )
         if i != 17:
-            scale = 1.0 / (256 ** 0.5)
+            sm_scale = 256 ** -0.5
             total_queries = buffers['encoder_Q'].shape[0]
             total_keys = encoder_seq_len
             flash_mqa_attention_kernel[lambda META: (triton.cdiv(total_queries, META["BLOCK_M"]),)](
@@ -414,7 +422,8 @@ def transformer_encoder(weights, buffers, encoder_seq_len):
                 buffers['valid_encoder_len'],
                 total_queries,
                 total_keys,
-                scale
+                sm_scale,
+                HEAD_DIM=256,
             )
             
             matmul_n_2048_2048_res(
