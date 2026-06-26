@@ -482,6 +482,89 @@ def softmax_kernel_prefix_suffix(
         vals = vals / vsum
         tl.store(out_ptr + offs_i * total_keys + offs_j, vals.to(tl.bfloat16), mask=in_bounds)
 
+configs2 = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w) \
+    for BM in [32, 64]\
+    for BN in [16, 32, 64]\
+    for s in [2, 3, 4] \
+    for w in [4, 8]\
+]
+@triton.autotune(configs=list(filter(keep, configs2)), key=["total_queries", "prefix_keys", "suffix_keys"])
+
+@triton.jit
+def flash_mqa_prefix_suffix_attention_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    valid_prefix_len_ptr,
+    total_queries: tl.constexpr,
+    prefix_keys: tl.constexpr,
+    suffix_keys: tl.constexpr,
+    sm_scale: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    total_keys: tl.constexpr = prefix_keys + suffix_keys
+    
+    valid_prefix_len = tl.load(valid_prefix_len_ptr).to(tl.int32)
+    valid_prefix_len = tl.maximum(0, tl.minimum(valid_prefix_len, prefix_keys))
+
+    q = tl.load(
+        q_ptr + offs_m[:, None] * HEAD_DIM + offs_d[None, :],
+        mask=offs_m[:, None] < total_queries,
+        other=0.0,
+    )
+
+    qk_scale: tl.constexpr = sm_scale * 1.44269504
+
+    m_i = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+
+    for start_n in range(0, total_keys, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        in_bounds = offs_n < total_keys
+        is_prefix = offs_n < prefix_keys
+        prefix_ok = is_prefix & (offs_n < valid_prefix_len)
+        suffix_ok = ~is_prefix
+        keys_mask = in_bounds & (prefix_ok | suffix_ok)
+
+        k = tl.load(
+            k_ptr + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
+            mask=keys_mask[:, None],
+            other=0.0,
+        )
+
+        qk = tl.dot(q, tl.trans(k)) * qk_scale
+        qk = tl.where(keys_mask[None, :], qk, -float("inf"))
+
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.math.exp2(qk - m_new[:, None])
+        alpha = tl.math.exp2(m_i - m_new)
+
+        v = tl.load(
+            v_ptr + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
+            mask=keys_mask[:, None],
+            other=0.0,
+        )
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    tl.store(
+        o_ptr + offs_m[:, None] * HEAD_DIM + offs_d[None, :],
+        acc.to(tl.bfloat16),
+        mask=offs_m[:, None] < total_queries,
+    )
+
 def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
     for step in range(num_steps):
         matmul_k_32_1024_bias(
@@ -509,40 +592,24 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 buffers['encoder_K'][i, encoder_seq_len:encoder_seq_len + seq_len],
                 buffers['encoder_V'][i, encoder_seq_len:encoder_seq_len + seq_len],
             )
+            sm_scale = 256 ** -0.5
             total_queries = buffers['decoder_q_buf'].shape[0]
             prefix_keys = encoder_seq_len
             suffix_keys = seq_len
-            total_keys = prefix_keys + suffix_keys
 
-            matmul_abT_scale[(((total_queries + 31) // 32) * ((total_keys + 31) // 32),)](
+            flash_mqa_prefix_suffix_attention_kernel[lambda META: (triton.cdiv(total_queries, META["BLOCK_M"]),)](
                 buffers['decoder_q_buf'],
                 buffers['encoder_K'][i, :encoder_seq_len + seq_len],
-                buffers['decoder_logits_buf'],
-                total_queries,
-                total_keys,
-                256,
-                256 ** -0.5,
-                BLOCK_SIZE_M=32,
-                BLOCK_SIZE_N=32,
-                BLOCK_SIZE_K=64,
-            )
-
-            softmax_kernel_prefix_suffix[((total_queries + 3) // 4,)](
-                buffers['decoder_logits_buf'],
+                buffers['encoder_V'][i, :encoder_seq_len + seq_len],
+                buffers['decoder_q_buf'],
+                buffers['valid_encoder_len'],
                 total_queries,
                 prefix_keys,
                 suffix_keys,
-                buffers['valid_encoder_len'],
-                buffers['decoder_attn_buf'],
-                BLOCK_SIZE_M=4,
-                BLOCK_SIZE=1024,
+                sm_scale,
+                HEAD_DIM=256,
             )
 
-            matmul_k8_n_256(
-                buffers['decoder_attn_buf'],
-                buffers['encoder_V'][i, :encoder_seq_len + seq_len],
-                buffers['decoder_q_buf'],
-            )
             matmul_k_2048_1024_gate(
                 buffers['decoder_q_buf'].view(-1, 2048),
                 weights['decoder_attn_o_w'][i],
