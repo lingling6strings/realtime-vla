@@ -661,34 +661,42 @@ def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.cons
             x = tl.load(inp_ptr + i * features + j + tl.arange(0, BLOCK_SIZE))
             x = x * factor
             tl.store(out_ptr + i * features + j + tl.arange(0, BLOCK_SIZE), x)
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_N': BN, 'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_K': BK}, num_stages=s, num_warps=w) \
+        for BN in [64]\
+        for BM in [64, 128]\
+        for BK in [32, 64]\
+        for s in [2, 3, 4]\
+        for w in [4, 8]\
+    ],
+    key=["seq_len"],
+)
 @triton.jit
 def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
     BLOCK_SIZE_N : tl.constexpr = 128,
     BLOCK_SIZE_M : tl.constexpr = 64,
     BLOCK_SIZE_K : tl.constexpr = 32):
 
-    pid1 = tl.program_id(axis=0)
-    psize1 = tl.num_programs(axis=0)
-    pid2 = tl.program_id(axis=1)
-    psize2 = tl.num_programs(axis=1)
+    i = tl.program_id(0) * BLOCK_SIZE_N
+    j = tl.program_id(1) * BLOCK_SIZE_M
     
-    for i in range(pid1 * BLOCK_SIZE_N, seq_len, psize1 * BLOCK_SIZE_N):
-        for j in range(pid2 * BLOCK_SIZE_M, hidden, psize2 * BLOCK_SIZE_M):
-            acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
-            acc2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
-            for k in range(0, features, BLOCK_SIZE_K):
-                x = tl.load(
-                    inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), 
-                    mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len,
-                    other = 0.0
-                )
-                w = tl.load(weight1_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
-                acc = tl.dot(x, w, acc)
-                w2 = tl.load(weight2_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
-                acc2 = tl.dot(x, w2, acc2)
-            acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
-            acc = (acc * acc2).to(tl.bfloat16)
-            tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
+    acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    for k in range(0, features, BLOCK_SIZE_K):
+        x = tl.load(
+            inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), 
+            mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len,
+            other = 0.0
+        )
+        w = tl.load(weight1_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+        acc = tl.dot(x, w, acc)
+        w2 = tl.load(weight2_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+        acc2 = tl.dot(x, w2, acc2)
+    acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+    acc = (acc * acc2).to(tl.bfloat16)
+    tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
 
 @triton.jit
 def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
@@ -727,7 +735,7 @@ def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_
 def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
     seq_len = x.shape[0]
     rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
-    matmul_small_gate[( (seq_len + 127)//128, (16384 + 63)//64 )](
+    matmul_small_gate[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(16384, META["BLOCK_SIZE_M"]))](
         x_norm, weight1, weight2, out, seq_len,
         2048, 16384
     )

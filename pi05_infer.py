@@ -626,7 +626,7 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 buffers['decoder_style_ffn'][step, i]
             )
             seq_len = buffers['decoder_x'].shape[0]
-            matmul_small_gate[( (seq_len + 127) // 128, (4096 + 63) // 64 )](
+            matmul_small_gate[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(4096, META["BLOCK_SIZE_M"]))](
                 buffers['x_normed_buf'],
                 weights['decoder_ffn_gate_w'][i],
                 weights['decoder_ffn_up_w'][i],
