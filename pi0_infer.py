@@ -671,7 +671,7 @@ def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.cons
         for s in [2, 3, 4]\
         for w in [4, 8]\
     ],
-    key=["seq_len"],
+    key=["seq_len", "features", "hidden"],
 )
 @triton.jit
 def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
