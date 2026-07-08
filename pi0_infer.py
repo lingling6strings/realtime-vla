@@ -681,22 +681,29 @@ def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.c
 
     i = tl.program_id(0) * BLOCK_SIZE_N
     j = tl.program_id(1) * BLOCK_SIZE_M
+    offs_n = i + tl.arange(0, BLOCK_SIZE_N)
+    offs_m = j + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
     
     acc = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     acc2 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     for k in range(0, features, BLOCK_SIZE_K):
         x = tl.load(
-            inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * features + k + tl.arange(0, BLOCK_SIZE_K), 
-            mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len,
+            inp_ptr + (offs_n[:, None]) * features + k + offs_k[None, :], 
+            mask = offs_n[:, None] < seq_len,
             other = 0.0
         )
-        w = tl.load(weight1_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+        w = tl.load(weight1_ptr + (k + offs_k[:, None]) * hidden + offs_m[None, :])
         acc = tl.dot(x, w, acc)
-        w2 = tl.load(weight2_ptr + (k + tl.arange(0, BLOCK_SIZE_K)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M))
+        w2 = tl.load(weight2_ptr + (k + offs_k[:, None]) * hidden + offs_m[None, :])
         acc2 = tl.dot(x, w2, acc2)
     acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
     acc = (acc * acc2).to(tl.bfloat16)
-    tl.store(out_ptr + (i + tl.arange(0, BLOCK_SIZE_N)[:, None]) * hidden + j + tl.arange(0, BLOCK_SIZE_M), acc, mask = i + tl.arange(0, BLOCK_SIZE_N)[:, None] < seq_len)
+    tl.store(
+        out_ptr + (offs_n[:, None]) * hidden + offs_m[None, :], 
+        acc, 
+        mask = offs_n[:, None] < seq_len
+    )
 
 @triton.jit
 def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
