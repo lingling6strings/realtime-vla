@@ -193,38 +193,47 @@ def matmul_small_bias_silu(inp_ptr, weight_ptr, out_ptr, bias_ptr, seq_len : tl.
             mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
         )
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_N': BN, 'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_K': BK}, num_stages=s, num_warps=w) \
+        for BN in [64]\
+        for BM in [64, 128]\
+        for BK in [32, 64, 128]\
+        for s in [2, 3, 4]\
+        for w in [4, 8]\
+    ],
+    key=["seq_len", "features", "hidden"],
+)
 @triton.jit
 def matmul_small_res(inp_ptr, weight_ptr, out_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
                          BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr):
     pid = tl.program_id(0)
-    psize = tl.num_programs(0)
-    grid_i = tl.cdiv(seq_len, BLOCK_SIZE_N)
     grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
-    for p in range(pid, grid_i * grid_j, psize):
-        i = (p // grid_j) * BLOCK_SIZE_N
-        j = (p % grid_j) * BLOCK_SIZE_M
-        acc = tl.load(
-            res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+    i = (pid // grid_j) * BLOCK_SIZE_N
+    j = (pid % grid_j) * BLOCK_SIZE_M
+
+    acc = tl.load(
+        res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+        mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+        other = 0.0
+    ).to(tl.float32)
+    for k in range(0, features, BLOCK_SIZE_K):
+        x = tl.load(
+            inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
+            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
             other = 0.0
-        ).to(tl.float32)
-        for k in range(0, features, BLOCK_SIZE_K):
-            x = tl.load(
-                inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
-                mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
-                other = 0.0
-            )
-            w = tl.load(
-                weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-                mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
-                other = 0.0
-            )
-            acc = tl.dot(x, w, acc)
-        tl.store(
-            out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            acc.to(tl.bfloat16),
-            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
         )
+        w = tl.load(
+            weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+            mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            other = 0.0
+        )
+        acc = tl.dot(x, w, acc)
+    tl.store(
+        out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+        acc.to(tl.bfloat16),
+        mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+    )
 
 @triton.jit
 def matmul_small(inp_ptr, weight_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -796,10 +805,7 @@ def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
 
 def matmul_n_16384_2048_res(x, weight, out):
     seq_len = x.shape[0]
-    BLOCK_SIZE_N = 128
-    if seq_len < 512:
-        BLOCK_SIZE_N = 64
-    matmul_small_res[((seq_len + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N) * (2048 // 64),](
+    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]) * triton.cdiv(2048, META["BLOCK_SIZE_M"]),)](
         x,
         weight,
         out,
@@ -807,9 +813,6 @@ def matmul_n_16384_2048_res(x, weight, out):
         seq_len = seq_len,
         features = 16384,
         hidden = 2048,
-        BLOCK_SIZE_N = BLOCK_SIZE_N,
-        BLOCK_SIZE_M = 64,
-        BLOCK_SIZE_K = 64
     )
 
 def layer_norm_matmul_n256_1152_2048_bias(x, norm_w, norm_b, proj_w, proj_b, out, x_norm):
@@ -887,7 +890,7 @@ def AttnSingleKey(Q, K, V, scale):
 
 def matmul_n_2048_2048_res(x, weight, out):
     seq_len = x.shape[0]
-    matmul_small_res[((seq_len + 127) // 128) * (2048 // 64),](
+    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]) * triton.cdiv(2048, META["BLOCK_SIZE_M"]),)](
         x,
         weight,
         out,
@@ -895,9 +898,6 @@ def matmul_n_2048_2048_res(x, weight, out):
         seq_len = seq_len,
         features = 2048,
         hidden = 2048,
-        BLOCK_SIZE_N = 128,
-        BLOCK_SIZE_M = 64,
-        BLOCK_SIZE_K = 64
     )
 
 def transformer_encoder(weights, buffers, encoder_seq_len):
