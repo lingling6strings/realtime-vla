@@ -207,32 +207,36 @@ def matmul_small_bias_silu(inp_ptr, weight_ptr, out_ptr, bias_ptr, seq_len : tl.
 @triton.jit
 def matmul_small_res(inp_ptr, weight_ptr, out_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
                          BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr):
-    pid = tl.program_id(0)
-    grid_j = tl.cdiv(hidden, BLOCK_SIZE_M)
-    i = (pid // grid_j) * BLOCK_SIZE_N
-    j = (pid % grid_j) * BLOCK_SIZE_M
+    pid_n = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    i = pid_n * BLOCK_SIZE_N
+    j = pid_m * BLOCK_SIZE_M
+
+    offs_n = i + tl.arange(0, BLOCK_SIZE_N)
+    offs_m = j + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     acc = tl.load(
-        res_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-        mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+        res_ptr + offs_n[:, None] * hidden + offs_m[None, :],
+        mask = (offs_n[:, None] < seq_len) & (offs_m[None, :] < hidden),
         other = 0.0
     ).to(tl.float32)
     for k in range(0, features, BLOCK_SIZE_K):
         x = tl.load(
-            inp_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * features + (k + tl.arange(0, BLOCK_SIZE_K))[None, :],
-            mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((k + tl.arange(0, BLOCK_SIZE_K))[None, :] < features),
+            inp_ptr + offs_n[:, None] * features + (k + offs_k)[None, :],
+            mask = (offs_n[:, None] < seq_len) & ((k + offs_k)[None, :] < features),
             other = 0.0
         )
         w = tl.load(
-            weight_ptr + (k + tl.arange(0, BLOCK_SIZE_K))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
-            mask = ((k + tl.arange(0, BLOCK_SIZE_K))[:, None] < features) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden),
+            weight_ptr + (k + offs_k)[:, None] * hidden + offs_m[None, :],
+            mask = ((k + offs_k)[:, None] < features) & (offs_m[None, :] < hidden),
             other = 0.0
         )
-        acc = tl.dot(x, w, acc)
+        acc = tl.dot(x, w, acc=acc)
     tl.store(
-        out_ptr + (i + tl.arange(0, BLOCK_SIZE_N))[:, None] * hidden + (j + tl.arange(0, BLOCK_SIZE_M))[None, :],
+        out_ptr + offs_n[:, None] * hidden + offs_m[None, :],
         acc.to(tl.bfloat16),
-        mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
+        mask = (offs_n[:, None] < seq_len) & (offs_m[None, :] < hidden)
     )
 
 @triton.jit
@@ -805,7 +809,7 @@ def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
 
 def matmul_n_16384_2048_res(x, weight, out):
     seq_len = x.shape[0]
-    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]) * triton.cdiv(2048, META["BLOCK_SIZE_M"]),)](
+    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(2048, META["BLOCK_SIZE_M"]))](
         x,
         weight,
         out,
@@ -890,7 +894,7 @@ def AttnSingleKey(Q, K, V, scale):
 
 def matmul_n_2048_2048_res(x, weight, out):
     seq_len = x.shape[0]
-    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]) * triton.cdiv(2048, META["BLOCK_SIZE_M"]),)](
+    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(2048, META["BLOCK_SIZE_M"]))](
         x,
         weight,
         out,
