@@ -205,6 +205,218 @@ def adarms_norm_style_proj(x, time_emb, mod_w, mod_b, x_normed, gate, style):
         features = 1024, 
         BLOCK_SIZE = 512
     )
+
+@triton.jit
+def adarms_qkv_rope_kernel(
+    x_ptr,
+    style_ptr,
+    weight_qkv_ptr,
+    rope_weights_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    gate_ptr,
+    seq_len: tl.constexpr,
+    features: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_heads: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    total_qkv_dim: tl.constexpr = (num_heads + 2) * head_dim
+
+    start_m = pid_m * BLOCK_M
+    start_n = pid_n * BLOCK_N
+
+    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+
+    # 每个 CTA 独立计算自己这些 token 的 RMS factor。
+    sum_sq = tl.zeros((BLOCK_M,),dtype=tl.float32,)
+
+    for start_k in range(0, features, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+
+        x = tl.load(
+            x_ptr + offs_m[:, None] * features + offs_k[None, :],
+            mask=((offs_m[:, None] < seq_len) & (offs_k[None, :] < features)),
+            other=0.0,
+        ).to(tl.float32)
+
+        sum_sq += tl.sum(x * x,axis=1,)
+
+        # 每个 M tile 只让 pid_n=0 的 CTA 写 gate，
+        # 避免不同 N tile 重复写同一块 gate_buf。
+        if pid_n == 0:
+            gate_value = tl.load(
+                style_ptr + 2 * features + offs_k,
+                mask=offs_k < features,
+                other=0.0,
+            ).to(tl.float32)
+
+            # style 的 gate 沿 token 维广播。
+            gate_tile = (
+                gate_value[None, :] + tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+            ).to(tl.bfloat16)
+
+            tl.store(
+                gate_ptr + offs_m[:, None] * features + offs_k[None, :],
+                gate_tile,
+                mask=((offs_m[:, None] < seq_len) & (offs_k[None, :] < features)),
+            )
+
+    rms_factor = tl.rsqrt(sum_sq / features + 1e-6)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # AdaRMSNorm + QKV matmul。
+    for start_k in range(0, features, BLOCK_K):
+        offs_k = start_k + tl.arange(0, BLOCK_K)
+
+        x = tl.load(x_ptr + offs_m[:, None] * features + offs_k[None, :],
+            mask=(
+                (offs_m[:, None] < seq_len)
+                & (offs_k[None, :] < features)
+            ),
+            other=0.0,
+        ).to(tl.float32)
+
+        # 保持原 adarms_norm_kernel 的行为：
+        # style 第0行广播给所有 token。
+        scale = tl.load(
+            style_ptr + offs_k,
+            mask=offs_k < features,
+            other=0.0,
+        ).to(tl.float32)
+
+        shift = tl.load(
+            style_ptr + features + offs_k,
+            mask=offs_k < features,
+            other=0.0,
+        ).to(tl.float32)
+
+        x_mod = (x * rms_factor[:, None] * (1.0 + scale[None, :]) + shift[None, :]
+        ).to(tl.bfloat16)
+
+        weight = tl.load(
+            weight_qkv_ptr + offs_k[:, None] * total_qkv_dim + offs_n[None, :],
+            mask=(
+                (offs_k[:, None] < features)
+                & (offs_n[None, :] < total_qkv_dim)
+            ),
+            other=0.0,
+        )
+
+        accumulator = tl.dot(x_mod, weight, accumulator)
+
+    # Q和K执行RoPE，V不执行。
+    if start_n < (num_heads + 1) * head_dim:
+        rope_offset = start_n % head_dim
+
+        rope = tl.load(
+            rope_weights_ptr
+            + offs_m[:, None] * head_dim
+            + rope_offset
+            + tl.arange(0, BLOCK_N)[None, :],
+            mask=offs_m[:, None] < seq_len,
+            other=0.0,
+        ).to(tl.float32)
+
+        acc_pair = tl.reshape(
+            accumulator,
+            (BLOCK_M, BLOCK_N // 2, 2),
+        )
+        x0, x1 = tl.split(acc_pair)
+
+        rope_pair = tl.reshape(
+            rope,
+            (BLOCK_M, BLOCK_N // 2, 2),
+        )
+        cos, sin = tl.split(rope_pair)
+
+        y0 = x0 * cos - x1 * sin
+        y1 = x1 * cos + x0 * sin
+
+        accumulator = tl.interleave(y0, y1)
+
+    output = accumulator.to(tl.bfloat16)
+
+    output_mask = (
+        (offs_m[:, None] < seq_len)
+        & (offs_n[None, :] < total_qkv_dim)
+    )
+
+    if start_n < num_heads * head_dim:
+        tl.store(
+            q_ptr + offs_m[:, None] * (num_heads * head_dim) + offs_n[None, :],
+            output,
+            mask=output_mask,
+        )
+    elif start_n < (num_heads + 1) * head_dim:
+        k_offset = start_n - num_heads * head_dim
+
+        tl.store(
+            k_ptr + offs_m[:, None] * head_dim + k_offset + tl.arange(0, BLOCK_N)[None, :],
+            output,
+            mask=offs_m[:, None] < seq_len,
+        )
+    else:
+        v_offset = start_n - (num_heads + 1) * head_dim
+
+        tl.store(
+            v_ptr
+            + offs_m[:, None] * head_dim
+            + v_offset
+            + tl.arange(0, BLOCK_N)[None, :],
+            output,
+            mask=offs_m[:, None] < seq_len,
+        )
+
+def adarms_matmul_k_1024_2560_qkv_rope(
+    x,
+    style,
+    weight_qkv,
+    rope_weight,
+    q,
+    k,
+    v,
+    gate,
+):
+    seq_len = x.shape[0]
+
+    BLOCK_M = 64
+    BLOCK_N = 128
+    BLOCK_K = 64
+
+    grid = (
+        triton.cdiv(seq_len, BLOCK_M),
+        triton.cdiv(2560, BLOCK_N),
+    )
+
+    adarms_qkv_rope_kernel[grid](
+        x,
+        style,
+        weight_qkv,
+        rope_weight,
+        q,
+        k,
+        v,
+        gate,
+        seq_len=seq_len,
+        features=1024,
+        head_dim=256,
+        num_heads=8,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+        num_stages=3,
+    )
+
 def adarms_norm_style_proj_final(x, time_emb, mod_w, mod_b, x_normed, gate, style):
     seq_len = x.shape[0]
 
@@ -575,22 +787,15 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
         )
         seq_len = buffers['decoder_x'].shape[0]
         for i in range(18):
-            adarms_norm_style_proj(
-                buffers['decoder_x'],
-                buffers['decoder_time_emb'][step],
-                weights['decoder_pre_attn_norm_mod_w'][i],
-                weights['decoder_pre_attn_norm_mod_b'][i],
-                buffers['x_normed_buf'],
-                buffers['gate_buf'],
-                buffers['decoder_style_attn'][step, i]
-            )
-            matmul_k_1024_2560_qkv_rope(
-                buffers['x_normed_buf'], 
-                weights['decoder_attn_qkv_w'][i],
-                buffers['decoder_rope_weights'],
+            adarms_matmul_k_1024_2560_qkv_rope(
+                buffers["decoder_x"],
+                buffers["decoder_style_attn"][step, i],
+                weights["decoder_attn_qkv_w"][i],
+                buffers["decoder_rope_weights"],
                 buffers['decoder_q_buf'],
                 buffers['encoder_K'][i, encoder_seq_len:encoder_seq_len + seq_len],
                 buffers['encoder_V'][i, encoder_seq_len:encoder_seq_len + seq_len],
+                buffers["gate_buf"],
             )
             sm_scale = 256 ** -0.5
             total_queries = buffers['decoder_q_buf'].shape[0]
