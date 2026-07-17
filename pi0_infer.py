@@ -239,6 +239,82 @@ def matmul_small_res(inp_ptr, weight_ptr, out_ptr, res_ptr, seq_len : tl.constex
         mask = (offs_n[:, None] < seq_len) & (offs_m[None, :] < hidden)
     )
 
+def _set_tma_block_shape(nargs):
+    BM = nargs["BLOCK_M"]
+    BN = nargs["BLOCK_N"]
+    BK = nargs["BLOCK_K"]
+
+    nargs["inp_desc"].block_shape = [BM, BK]
+    nargs["weight_desc"].block_shape = [BK, BN]
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN, 'BLOCK_K': BK, 'GROUP_M': GM}, num_stages=s, num_warps=w, pre_hook=_set_tma_block_shape) \
+        for BM in [32, 64]\
+        for BN in [64, 128]\
+        for BK in [64, 128]\
+        for GM in [4, 8, 16]\
+        for s in [2, 3, 4]\
+        for w in [4, 8]\
+    ],
+    key=["seq_len", "features", "hidden"],
+)
+@triton.jit
+def matmul_small_res_ffndown(
+    inp_desc,
+    weight_desc,
+    out_ptr,
+    seq_len : tl.constexpr, 
+    features : tl.constexpr, 
+    hidden : tl.constexpr,
+    BLOCK_M: tl.constexpr = 64,
+    BLOCK_N: tl.constexpr = 128,
+    BLOCK_K: tl.constexpr = 64,
+    GROUP_M: tl.constexpr = 16,
+):
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(seq_len, BLOCK_M)
+    num_pid_n = tl.cdiv(hidden, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M
+    offs_n = pid_n * BLOCK_N
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32,)
+
+    k_tiles = tl.cdiv(features, BLOCK_K)
+
+    for k in tl.range(k_tiles, warp_specialize=False):
+        offs_k = k * BLOCK_K
+
+        x = inp_desc.load([offs_m, offs_k])
+        weight = weight_desc.load([offs_k, offs_n])
+
+        accumulator = tl.dot(x, weight, accumulator)
+
+    rows = offs_m + tl.arange(0, BLOCK_M)
+    cols = offs_n + tl.arange(0, BLOCK_N)
+
+    residual = tl.load(
+        out_ptr + rows[:, None] * hidden + cols[None, :],
+        mask = (rows[:, None] < seq_len) & (cols[None, :] < hidden),
+        other = 0.0,
+    ).to(tl.float32)
+
+    result = accumulator + residual
+    # 保持原 kernel 的 BF16 输出。
+    tl.store(
+        out_ptr + rows[:, None] * hidden + cols[None, :],
+        result.to(tl.bfloat16),
+        mask = (rows[:, None] < seq_len) & (cols[None, :] < hidden),
+    )
+
 @triton.jit
 def matmul_small(inp_ptr, weight_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
                          BLOCK_SIZE_N : tl.constexpr, BLOCK_SIZE_M : tl.constexpr, BLOCK_SIZE_K : tl.constexpr):
@@ -809,10 +885,12 @@ def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
 
 def matmul_n_16384_2048_res(x, weight, out):
     seq_len = x.shape[0]
-    matmul_small_res[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(2048, META["BLOCK_SIZE_M"]))](
-        x,
-        weight,
-        out,
+    dummy_block = [1, 1]
+    x_desc = TensorDescriptor.from_tensor(x, dummy_block)
+    w_desc = TensorDescriptor.from_tensor(weight, dummy_block)
+    matmul_small_res_ffndown[lambda META: (triton.cdiv(seq_len, META["BLOCK_M"]) * triton.cdiv(2048, META["BLOCK_N"]),)](
+        x_desc,
+        w_desc,
         out,
         seq_len = seq_len,
         features = 16384,
