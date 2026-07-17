@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 @triton.jit
 def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -662,6 +663,47 @@ def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.cons
             x = x * factor
             tl.store(out_ptr + i * features + j + tl.arange(0, BLOCK_SIZE), x)
 
+@triton.jit
+def matmul_small_gate_encoder(x_desc, w_desc, w2_desc, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
+    BLOCK_SIZE_M : tl.constexpr = 64,
+    BLOCK_SIZE_N : tl.constexpr = 128,
+    BLOCK_SIZE_K : tl.constexpr = 64,
+    GROUP_SIZE_M : tl.constexpr = 16,
+    num_stages = 3,
+    num_warps = 4
+    ):
+
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(seq_len, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(hidden, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(features, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_SIZE_M
+    offs_n = pid_n * BLOCK_SIZE_N
+    
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, k_tiles, warp_specialize=True):
+        offs_k = k * BLOCK_SIZE_K
+        x = x_desc.load([offs_m, offs_k])
+        w = w_desc.load([offs_k, offs_n])
+        acc = tl.dot(x, w, acc)
+        w2 = w2_desc.load([offs_k, offs_n])
+        acc2 = tl.dot(x, w2, acc2)
+    acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+    acc = (acc * acc2).to(tl.bfloat16)
+    tl.store(
+        out_ptr + (offs_m + tl.arange(0, BLOCK_SIZE_M)[:, None]) * hidden + offs_n + tl.arange(0, BLOCK_SIZE_N)[None, :], 
+        acc, 
+        mask = offs_m[:, None] < seq_len
+    )
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_N': BN, 'BLOCK_SIZE_M': BM, 'BLOCK_SIZE_K': BK}, num_stages=s, num_warps=w) \
@@ -742,9 +784,12 @@ def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_
 def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
     seq_len = x.shape[0]
     rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
-    matmul_small_gate[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(16384, META["BLOCK_SIZE_M"]))](
-        x_norm, weight1, weight2, out, seq_len,
-        2048, 16384
+    x_desc = TensorDescriptor.from_tensor(x_norm, [64, 64])
+    w_desc = TensorDescriptor.from_tensor(weight1, [64, 128])
+    w2_desc = TensorDescriptor.from_tensor(weight2, [64, 128])
+
+    matmul_small_gate_encoder[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_M"])*triton.cdiv(16384, META["BLOCK_SIZE_N"]),)](
+        x_desc, w_desc, w2_desc, out, seq_len, 2048, 16384
     )
 
 def matmul_n_16384_2048_res(x, weight, out):
