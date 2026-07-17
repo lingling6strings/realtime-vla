@@ -698,10 +698,12 @@ def matmul_small_gate_encoder(x_desc, w_desc, w2_desc, out_ptr, seq_len : tl.con
         acc2 = tl.dot(x, w2, acc2)
     acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
     acc = (acc * acc2).to(tl.bfloat16)
+    rows = offs_m + tl.arange(0, BLOCK_SIZE_M)
+    cols = offs_n + tl.arange(0, BLOCK_SIZE_N)
     tl.store(
-        out_ptr + (offs_m + tl.arange(0, BLOCK_SIZE_M)[:, None]) * hidden + offs_n + tl.arange(0, BLOCK_SIZE_N)[None, :], 
+        out_ptr + rows[:, None] * hidden + cols[None, :],
         acc, 
-        mask = offs_m[:, None] < seq_len
+        mask = (rows[:, None] < seq_len) & (cols[None, :] < hidden),
     )
 
 @triton.autotune(
