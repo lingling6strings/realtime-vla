@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+from gluon_large_gemm import launch_gate_encoder, launch_res_ffndown
 
 @triton.jit
 def matmul_small_bias_res(inp_ptr, weight_ptr, out_ptr, bias_ptr, res_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden : tl.constexpr,
@@ -912,27 +913,10 @@ def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_
 def rms_matmul_n_2048_16384_gate(x, weight1, weight2, out, x_norm):
     seq_len = x.shape[0]
     rms_norm_kernel[(seq_len,)](x, x_norm, seq_len, 2048)
-    x_desc = TensorDescriptor.from_tensor(x_norm, [64, 64])
-    w_desc = TensorDescriptor.from_tensor(weight1, [64, 128])
-    w2_desc = TensorDescriptor.from_tensor(weight2, [64, 128])
-
-    matmul_small_gate_encoder[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_M"])*triton.cdiv(16384, META["BLOCK_SIZE_N"]),)](
-        x_desc, w_desc, w2_desc, out, seq_len, 2048, 16384
-    )
+    launch_gate_encoder(x_norm, weight1, weight2, out)
 
 def matmul_n_16384_2048_res(x, weight, out):
-    seq_len = x.shape[0]
-    dummy_block = [1, 1]
-    x_desc = TensorDescriptor.from_tensor(x, dummy_block)
-    w_desc = TensorDescriptor.from_tensor(weight, dummy_block)
-    matmul_small_res_ffndown[lambda META: (triton.cdiv(seq_len, META["BLOCK_M"]) * triton.cdiv(2048, META["BLOCK_N"]),)](
-        x_desc,
-        w_desc,
-        out,
-        seq_len = seq_len,
-        features = 16384,
-        hidden = 2048,
-    )
+    launch_res_ffndown(x, weight, out)
 
 def layer_norm_matmul_n256_1152_2048_bias(x, norm_w, norm_b, proj_w, proj_b, out, x_norm):
     seq_len = x.shape[0] * 256
