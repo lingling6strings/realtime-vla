@@ -876,6 +876,72 @@ def matmul_small_gate(inp_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.c
         mask = offs_n[:, None] < seq_len
     )
 
+
+@triton.jit
+def matmul_small_gate_tma_kernel(
+    inp_desc,
+    weight1_desc,
+    weight2_desc,
+    out_ptr,
+    seq_len: tl.constexpr,
+    features: tl.constexpr,
+    hidden: tl.constexpr,
+    BLOCK_M: tl.constexpr = 64,
+    BLOCK_N: tl.constexpr = 128,
+    BLOCK_K: tl.constexpr = 32,
+):
+    """Fixed winner tile with descriptor-backed TMA loads on Blackwell."""
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offs_m = pid_m * BLOCK_M
+    offs_n = pid_n * BLOCK_N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    k_tiles = tl.cdiv(features, BLOCK_K)
+    for k_tile in tl.range(k_tiles, warp_specialize=True):
+        offs_k = k_tile * BLOCK_K
+        x = inp_desc.load([offs_m, offs_k])
+        w = weight1_desc.load([offs_k, offs_n])
+        acc = tl.dot(x, w, acc)
+        w2 = weight2_desc.load([offs_k, offs_n])
+        acc2 = tl.dot(x, w2, acc2)
+
+    acc = acc * tl.sigmoid(1.5957691216057308 * acc * (1 + 0.044715 * acc * acc))
+    result = (acc * acc2).to(tl.bfloat16)
+    rows = offs_m + tl.arange(0, BLOCK_M)
+    cols = offs_n + tl.arange(0, BLOCK_N)
+    tl.store(
+        out_ptr + rows[:, None] * hidden + cols[None, :],
+        result,
+        mask=(rows[:, None] < seq_len) & (cols[None, :] < hidden),
+    )
+
+
+def matmul_small_gate_tma(x, weight1, weight2, out):
+    """Launch the fixed 64x128x32, four-warp, two-stage TMA kernel."""
+    seq_len, features = x.shape
+    hidden = weight1.shape[1]
+    inp_desc = TensorDescriptor.from_tensor(x, [64, 32])
+    weight1_desc = TensorDescriptor.from_tensor(weight1, [32, 128])
+    weight2_desc = TensorDescriptor.from_tensor(weight2, [32, 128])
+    return matmul_small_gate_tma_kernel[
+        (triton.cdiv(seq_len, 64), triton.cdiv(hidden, 128))
+    ](
+        inp_desc,
+        weight1_desc,
+        weight2_desc,
+        out,
+        seq_len,
+        features,
+        hidden,
+        BLOCK_M=64,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+
 @triton.jit
 def scaled_matmul_small_gate(inp_ptr, inp_norm_factor_ptr, weight1_ptr, weight2_ptr, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
     BLOCK_SIZE_N : tl.constexpr = 64,

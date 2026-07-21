@@ -14,7 +14,7 @@ from pi0_infer import (
     matmul_small_bias,
     matmul_small_bias_res,
     matmul_small_bias_silu,
-    matmul_small_gate,
+    matmul_small_gate_tma,
     matmul_k8_n_256,
     matmul_abT_scale,
 )
@@ -626,14 +626,11 @@ def transformer_decoder(weights, buffers, encoder_seq_len, num_steps=10):
                 buffers['decoder_style_ffn'][step, i]
             )
             seq_len = buffers['decoder_x'].shape[0]
-            matmul_small_gate[lambda META: (triton.cdiv(seq_len, META["BLOCK_SIZE_N"]),triton.cdiv(4096, META["BLOCK_SIZE_M"]))](
+            matmul_small_gate_tma(
                 buffers['x_normed_buf'],
                 weights['decoder_ffn_gate_w'][i],
                 weights['decoder_ffn_up_w'][i],
                 buffers['decoder_hidden'],
-                seq_len,
-                1024,
-                4096,
             )
             matmul_k_4096_1024_gate(
                 buffers['decoder_hidden'],
