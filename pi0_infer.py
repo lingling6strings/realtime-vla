@@ -256,8 +256,18 @@ def _set_tma_block_shape(nargs):
         for GM in [4, 8, 16]\
         for s in [2, 3, 4]\
         for w in [4, 8]\
+    ] + [
+        triton.Config(
+            {'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_M': 16},
+            num_stages=s,
+            num_warps=w,
+            pre_hook=_set_tma_block_shape,
+        )
+        for s in [2, 3, 4]
+        for w in [4, 8]
     ],
     key=["seq_len", "features", "hidden"],
+    restore_value=["out_ptr"],
 )
 @triton.jit
 def matmul_small_res_ffndown(
@@ -290,7 +300,7 @@ def matmul_small_res_ffndown(
 
     k_tiles = tl.cdiv(features, BLOCK_K)
 
-    for k in tl.range(k_tiles, warp_specialize=False):
+    for k in tl.range(k_tiles, warp_specialize=True):
         offs_k = k * BLOCK_K
 
         x = inp_desc.load([offs_m, offs_k])
@@ -752,14 +762,41 @@ def rms_norm_kernel(inp_ptr, out_ptr, seq_len : tl.constexpr, features : tl.cons
             x = x * factor
             tl.store(out_ptr + i * features + j + tl.arange(0, BLOCK_SIZE), x)
 
+def _set_gate_encoder_tma_block_shape(nargs):
+    block_m = nargs["BLOCK_SIZE_M"]
+    block_n = nargs["BLOCK_SIZE_N"]
+    block_k = nargs["BLOCK_SIZE_K"]
+    nargs["x_desc"].block_shape = [block_m, block_k]
+    nargs["w_desc"].block_shape = [block_k, block_n]
+    nargs["w2_desc"].block_shape = [block_k, block_n]
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": block_m,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 16,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+            pre_hook=_set_gate_encoder_tma_block_shape,
+        )
+        for block_m in [64, 128]
+        for num_stages in [2, 3, 4]
+        for num_warps in [4, 8]
+    ],
+    key=["seq_len", "features", "hidden"],
+    restore_value=["out_ptr"],
+)
 @triton.jit
 def matmul_small_gate_encoder(x_desc, w_desc, w2_desc, out_ptr, seq_len : tl.constexpr, features : tl.constexpr, hidden: tl.constexpr,
     BLOCK_SIZE_M : tl.constexpr = 64,
     BLOCK_SIZE_N : tl.constexpr = 128,
     BLOCK_SIZE_K : tl.constexpr = 64,
     GROUP_SIZE_M : tl.constexpr = 16,
-    num_stages = 3,
-    num_warps = 4
     ):
 
     pid = tl.program_id(axis=0)
@@ -791,7 +828,7 @@ def matmul_small_gate_encoder(x_desc, w_desc, w2_desc, out_ptr, seq_len : tl.con
     cols = offs_n + tl.arange(0, BLOCK_SIZE_N)
     tl.store(
         out_ptr + rows[:, None] * hidden + cols[None, :],
-        acc, 
+        acc,
         mask = (rows[:, None] < seq_len) & (cols[None, :] < hidden),
     )
 
