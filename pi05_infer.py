@@ -65,6 +65,46 @@ def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr, seq_l
         )
 
 
+def _set_res_gate_tma_block_shape(nargs):
+    block_m = nargs["BLOCK_M"]
+    block_n = nargs["BLOCK_N"]
+    block_k = nargs["BLOCK_K"]
+    nargs["inp_desc"].block_shape = [block_m, block_k]
+    nargs["weight_desc"].block_shape = [block_k, block_n]
+
+
+_RES_GATE_TMA_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_M": 32,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "WARP_SPECIALIZE": True,
+        },
+        num_stages=2,
+        num_warps=4,
+        pre_hook=_set_res_gate_tma_block_shape,
+    ),
+    triton.Config(
+        {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "WARP_SPECIALIZE": True,
+        },
+        num_stages=3,
+        num_warps=4,
+        pre_hook=_set_res_gate_tma_block_shape,
+    ),
+]
+
+
+@triton.autotune(
+    configs=_RES_GATE_TMA_CONFIGS,
+    key=["seq_len", "features", "hidden"],
+    restore_value=["out_ptr"],
+    cache_results=True,
+)
 @triton.jit
 def matmul_small_res_gate_tma_kernel(
     inp_desc,
@@ -120,19 +160,16 @@ def matmul_small_res_gate_tma(
     weight,
     out,
     gate,
-    block_m,
-    block_n,
-    block_k,
-    warp_specialize=True,
-    num_stages=2,
 ):
     seq_len, features = x.shape
     hidden = weight.shape[1]
-    inp_desc = TensorDescriptor.from_tensor(x, [block_m, block_k])
-    weight_desc = TensorDescriptor.from_tensor(weight, [block_k, block_n])
-    return matmul_small_res_gate_tma_kernel[
-        (triton.cdiv(seq_len, block_m), triton.cdiv(hidden, block_n))
-    ](
+    inp_desc = TensorDescriptor.from_tensor(x, [32, 64])
+    weight_desc = TensorDescriptor.from_tensor(weight, [64, 128])
+    grid = lambda meta: (
+        triton.cdiv(seq_len, meta["BLOCK_M"]),
+        triton.cdiv(hidden, meta["BLOCK_N"]),
+    )
+    return matmul_small_res_gate_tma_kernel[grid](
         inp_desc,
         weight_desc,
         out,
@@ -141,12 +178,6 @@ def matmul_small_res_gate_tma(
         seq_len,
         features,
         hidden,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        WARP_SPECIALIZE=warp_specialize,
-        num_warps=4,
-        num_stages=num_stages,
     )
 
 def matmul_k_32_1024_bias(x, weight, bias, out):
@@ -334,10 +365,10 @@ def adarms_matmul_k_1024_32_bias_res(
     )
 
 def matmul_k_2048_1024_gate(x, weight, out, gate):
-    matmul_small_res_gate_tma(x, weight, out, gate, 32, 128, 64)
+    matmul_small_res_gate_tma(x, weight, out, gate)
 
 def matmul_k_4096_1024_gate(x, weight, out, gate):
-    matmul_small_res_gate_tma(x, weight, out, gate, 32, 128, 64)
+    matmul_small_res_gate_tma(x, weight, out, gate)
 
 @triton.jit
 def softmax_kernel_masklen(
