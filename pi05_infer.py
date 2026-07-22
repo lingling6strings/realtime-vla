@@ -4,6 +4,7 @@ import triton.language as tl
 import numpy as np
 import torch.nn as nn
 from transformers import AutoTokenizer
+from triton.tools.tensor_descriptor import TensorDescriptor
 from pi0_infer import (
     vision_encoder,
     layer_norm_matmul_n256_1152_2048_bias,
@@ -62,6 +63,91 @@ def matmul_small_res_gate(inp_ptr, weight_ptr, out_ptr, res_ptr, gate_ptr, seq_l
             acc.to(tl.bfloat16),
             mask = ((i + tl.arange(0, BLOCK_SIZE_N))[:, None] < seq_len) & ((j + tl.arange(0, BLOCK_SIZE_M))[None, :] < hidden)
         )
+
+
+@triton.jit
+def matmul_small_res_gate_tma_kernel(
+    inp_desc,
+    weight_desc,
+    out_ptr,
+    res_ptr,
+    gate_ptr,
+    seq_len: tl.constexpr,
+    features: tl.constexpr,
+    hidden: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr = True,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offs_m = pid_m * BLOCK_M
+    offs_n = pid_n * BLOCK_N
+
+    rows = offs_m + tl.arange(0, BLOCK_M)
+    cols = offs_n + tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < seq_len) & (cols[None, :] < hidden)
+    residual = tl.load(
+        res_ptr + rows[:, None] * hidden + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    k_tiles = tl.cdiv(features, BLOCK_K)
+    for k_tile in tl.range(k_tiles, warp_specialize=WARP_SPECIALIZE):
+        offs_k = k_tile * BLOCK_K
+        x = inp_desc.load([offs_m, offs_k])
+        weight = weight_desc.load([offs_k, offs_n])
+        accumulator = tl.dot(x, weight, accumulator)
+
+    gate = tl.load(
+        gate_ptr + rows[:, None] * hidden + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    result = residual + accumulator * gate
+    tl.store(
+        out_ptr + rows[:, None] * hidden + cols[None, :],
+        result.to(tl.bfloat16),
+        mask=mask,
+    )
+
+
+def matmul_small_res_gate_tma(
+    x,
+    weight,
+    out,
+    gate,
+    block_m,
+    block_n,
+    block_k,
+    warp_specialize=True,
+    num_stages=2,
+):
+    seq_len, features = x.shape
+    hidden = weight.shape[1]
+    inp_desc = TensorDescriptor.from_tensor(x, [block_m, block_k])
+    weight_desc = TensorDescriptor.from_tensor(weight, [block_k, block_n])
+    return matmul_small_res_gate_tma_kernel[
+        (triton.cdiv(seq_len, block_m), triton.cdiv(hidden, block_n))
+    ](
+        inp_desc,
+        weight_desc,
+        out,
+        out,
+        gate,
+        seq_len,
+        features,
+        hidden,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARP_SPECIALIZE=warp_specialize,
+        num_warps=4,
+        num_stages=num_stages,
+    )
 
 def matmul_k_32_1024_bias(x, weight, bias, out):
     seq_len = x.shape[0]
@@ -248,36 +334,10 @@ def adarms_matmul_k_1024_32_bias_res(
     )
 
 def matmul_k_2048_1024_gate(x, weight, out, gate):
-    seq_len = x.shape[0]
-    matmul_small_res_gate[(128,)](
-        x,
-        weight,
-        out,
-        out, 
-        gate,
-        seq_len = seq_len,
-        features = 2048,
-        hidden = 1024,
-        BLOCK_SIZE_N = 32,
-        BLOCK_SIZE_M = 32,
-        BLOCK_SIZE_K = 128
-    )
+    matmul_small_res_gate_tma(x, weight, out, gate, 32, 128, 64)
 
 def matmul_k_4096_1024_gate(x, weight, out, gate):
-    seq_len = x.shape[0]
-    matmul_small_res_gate[(((seq_len + 15) // 16) * (1024 // 32),)](
-        x,
-        weight,
-        out,
-        out,
-        gate,
-        seq_len = seq_len,
-        features = 4096,
-        hidden = 1024,
-        BLOCK_SIZE_N = 16,
-        BLOCK_SIZE_M = 32,
-        BLOCK_SIZE_K = 256
-    )
+    matmul_small_res_gate_tma(x, weight, out, gate, 32, 128, 64)
 
 @triton.jit
 def softmax_kernel_masklen(
